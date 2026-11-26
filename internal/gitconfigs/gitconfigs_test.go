@@ -616,6 +616,144 @@ func TestEnsureGitignoreUntracksCommittedLog(t *testing.T) {
 	}
 }
 
+func TestAssemblerExcludesSkipAddedFilesKeepTracked(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	gitInit(t, dir)
+
+	// The pack tag tracks one locale file under an excluded path.
+	tracked := "config/txloader/load/tectech/lang/ru_RU.lang"
+	writeFile(t, filepath.Join(dir, tracked), "pack\n")
+	if err := runGit(ctx, dir, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, dir, "commit", "-m", "pack"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureAssemblerExcludes(dir); err != nil {
+		t.Fatalf("ensureAssemblerExcludes: %v", err)
+	}
+	first, _ := os.ReadFile(filepath.Join(dir, ".git", "info", "exclude"))
+	if err := ensureAssemblerExcludes(dir); err != nil {
+		t.Fatalf("second ensureAssemblerExcludes: %v", err)
+	}
+	second, _ := os.ReadFile(filepath.Join(dir, ".git", "info", "exclude"))
+	if string(first) != string(second) {
+		t.Fatalf("not idempotent: %q vs %q", first, second)
+	}
+
+	// Files the assembler adds on top of the tag, plus a real player edit.
+	writeFile(t, filepath.Join(dir, tracked), "changed\n")
+	writeFile(t, filepath.Join(dir, "config/txloader/load/gregtech/lang/de_DE.lang"), "x\n")
+	writeFile(t, filepath.Join(dir, "config/txloader/load/GuideNH[guidenh]/lang/ru_RU/tooltip/a.txt"), "x\n")
+	writeFile(t, filepath.Join(dir, "config/txloader/load/changelog/guidenh/en_us/index.md"), "x\n")
+	writeFile(t, filepath.Join(dir, "config/guidenh/DefaultGuide.zip"), "x")
+	writeFile(t, filepath.Join(dir, "config/mod.cfg"), "player\n")
+
+	if err := runGit(ctx, dir, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runGitOutput(ctx, dir, "diff", "--cached", "--name-only")
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	got := strings.Fields(out)
+	want := []string{"config/mod.cfg", tracked}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("staged = %v, want %v", got, want)
+	}
+}
+
+func TestUntrackAssemblerFilesMigratesOldRepo(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	gitInit(t, dir)
+
+	// Pack tag tracks one locale file under an excluded path.
+	packLang := "config/txloader/load/tectech/lang/ru_RU.lang"
+	writeFile(t, filepath.Join(dir, packLang), "pack\n")
+	if err := runGit(ctx, dir, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, dir, "commit", "-m", "pack"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, dir, "tag", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// An old init committed the assembler files as local additions.
+	added := []string{
+		"config/txloader/load/gregtech/lang/de_DE.lang",
+		"config/txloader/load/GuideNH[guidenh]/lang/ru_RU/tooltip/a.txt",
+		"config/txloader/load/changelog/guidenh/en_us/index.md",
+		"config/guidenh/DefaultGuide.zip",
+	}
+	for _, p := range added {
+		writeFile(t, filepath.Join(dir, p), "x\n")
+	}
+	writeFile(t, filepath.Join(dir, "config/mod.cfg"), "player\n")
+	if err := runGit(ctx, dir, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, dir, "commit", "-m", "old init"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureAssemblerExcludes(dir); err != nil {
+		t.Fatalf("ensureAssemblerExcludes: %v", err)
+	}
+	untrackAssemblerFiles(ctx, dir, "v1")
+	if err := runGit(ctx, dir, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, dir, "commit", "-m", "snapshot"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runGitOutput(ctx, dir, "diff", "--name-only", "v1", "HEAD")
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if got := strings.TrimSpace(out); got != "config/mod.cfg" {
+		t.Fatalf("diff v1..HEAD = %q, want only config/mod.cfg", got)
+	}
+	for _, p := range append(added, packLang) {
+		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
+			t.Errorf("%s removed from disk: %v", p, err)
+		}
+	}
+}
+
+func TestUntrackAssemblerFilesKeepsIndexWithoutPackTag(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	gitInit(t, dir)
+
+	lang := "config/txloader/load/gregtech/lang/de_DE.lang"
+	writeFile(t, filepath.Join(dir, lang), "x\n")
+	if err := runGit(ctx, dir, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGit(ctx, dir, "commit", "-m", "old init"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureAssemblerExcludes(dir); err != nil {
+		t.Fatalf("ensureAssemblerExcludes: %v", err)
+	}
+
+	// No origin and no such tag: the fetch fails, so nothing is untracked.
+	untrackAssemblerFiles(ctx, dir, "missing-tag")
+	out, err := runGitOutput(ctx, dir, "ls-files", lang)
+	if err != nil {
+		t.Fatalf("ls-files: %v", err)
+	}
+	if strings.TrimSpace(out) != lang {
+		t.Fatalf("%s untracked without pack tree", lang)
+	}
+}
+
 // TestFetchForceUpdatesMovedUpstreamTag guards the nightly-tag mutation case:
 // GTNH re-points nightly tags upstream; without --force, `git fetch` keeps the
 // stale local ref, the next merge says "Already up to date", and the real pack
@@ -758,7 +896,7 @@ func TestSnapshotOfStampedConfigDoesNotChurn(t *testing.T) {
 	if !found {
 		t.Fatalf("first Apply did not stamp config/DreamCoreMod.properties, stamped = %v", stamped)
 	}
-	if err := Snapshot(ctx, gameDir, "server"); err != nil {
+	if err := Snapshot(ctx, gameDir, "server", ""); err != nil {
 		t.Fatalf("first snapshot: %v", err)
 	}
 
@@ -766,7 +904,7 @@ func TestSnapshotOfStampedConfigDoesNotChurn(t *testing.T) {
 	if _, err := versionstamp.Apply(gameDir, gameDir, v); err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
-	if err := Snapshot(ctx, gameDir, "server"); err != nil {
+	if err := Snapshot(ctx, gameDir, "server", ""); err != nil {
 		t.Fatalf("second snapshot: %v", err)
 	}
 
@@ -810,7 +948,7 @@ func TestStampedConfigMergesCleanlyAcrossPackUpdate(t *testing.T) {
 
 	// The instance's stamp is snapshotted onto `local`.
 	writeFile(t, filepath.Join(gameDir, "config", "DreamCoreMod.properties"), stampedLine)
-	if err := Snapshot(ctx, gameDir, "server"); err != nil {
+	if err := Snapshot(ctx, gameDir, "server", ""); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
@@ -827,5 +965,72 @@ func TestStampedConfigMergesCleanlyAcrossPackUpdate(t *testing.T) {
 	}
 	if strings.TrimSpace(string(got)) != "displayedModpackVersion=2.9.1" {
 		t.Fatalf("after merge = %q, want the pack default 2.9.1", strings.TrimSpace(string(got)))
+	}
+}
+
+func TestApplyUpdateRetriesFailedConfigSwap(t *testing.T) {
+	if !IsGitAvailable() {
+		t.Skip("git not available")
+	}
+	ctx := t.Context()
+	gameDir, repoDir := setupStampRepo(t)
+	const configPath = "config/DreamCoreMod.properties"
+	const packConfig = "displayedModpackVersion=2.9.1\n"
+	const journeyMapPath = "journeymap/data/pack.cfg"
+	git := func(args ...string) {
+		t.Helper()
+		if err := runGit(ctx, repoDir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("checkout", "main")
+	writeFile(t, filepath.Join(repoDir, configPath), packConfig)
+	writeFile(t, filepath.Join(repoDir, journeyMapPath), "pack data\n")
+	git("add", "--", configPath, journeyMapPath)
+	git("commit", "-m", "pack v2")
+	git("tag", "v2")
+	git("checkout", "local")
+	git("remote", "add", "origin", repoDir)
+
+	instanceConfig := filepath.Join(gameDir, configPath)
+	writeFile(t, instanceConfig, stampedLine)
+	playerJourneyMap := filepath.Join(gameDir, "journeymap/data/player.cfg")
+	writeFile(t, playerJourneyMap, "player data\n")
+	if err := Snapshot(ctx, gameDir, "client", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(gameDir, "config.bak", "existing")
+	writeFile(t, blocker, "keep\n")
+	if err := ApplyUpdate(ctx, gameDir, "client", "v1", "v2"); err == nil || !strings.Contains(err.Error(), "renaming") {
+		t.Fatalf("want rename failure, got %v", err)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Dir(blocker)); err != nil {
+		t.Fatal(err)
+	}
+	playerConfig := filepath.Join(gameDir, "config", "my-settings.cfg")
+	writeFile(t, playerConfig, "edited after failure\n")
+
+	if err := Snapshot(ctx, gameDir, "client", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	snapshotFiles, err := runGitOutput(ctx, repoDir, "ls-tree", "-r", "--name-only", "HEAD", "--", journeyMapPath)
+	if err != nil || strings.TrimSpace(snapshotFiles) != "" {
+		t.Fatalf("snapshot contains unapplied pack data: %q, %v", snapshotFiles, err)
+	}
+	if err := ApplyUpdate(ctx, gameDir, "client", "v1", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{
+		instanceConfig:   packConfig,
+		playerConfig:     "edited after failure\n",
+		playerJourneyMap: "player data\n",
+	} {
+		data, err := os.ReadFile(name)
+		if err != nil || strings.ReplaceAll(string(data), "\r\n", "\n") != want {
+			t.Errorf("%s = %q, %v; want %q", name, data, err, want)
+		}
 	}
 }
